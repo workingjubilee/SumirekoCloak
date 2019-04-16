@@ -4,7 +4,7 @@
  * 
  *  Using: 
  *  * Adafruit Feather M0 Express
- *  * Adafruit Feather NeoPXL8
+ *  * Adafruit Feather NeoPXL87
  *  * Adafruit Feather Hallowing
  *  * Adafruit INA219 Breakout Board
  *  * Adafruit I2C OLED Display
@@ -14,23 +14,39 @@
  * 
  */
 
-#include <Adafruit_NeoPXL8.h>
 #include <Wire.h>
+#include <Adafruit_NeoPXL8.h>
+#include <Adafruit_INA219.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
 
 #define NUM_LED 64  // Multiply by 8, as per NeoPXL8 documentation
-
-#define NUM_LED_MATRIX_HEIGHT 16
-#define NUM_LED_MATRIX_WIDTH 32
-#define NUM_LED_TOTAL 512 // total LEDs
 
 // SDA pin (I2C) remapped to MOSI
 int8_t pins[8] = { A3, MOSI, A4, 5, MISO, PIN_SERIAL1_TX, 13, PIN_SERIAL1_RX};
 
 Adafruit_NeoPXL8 leds(NUM_LED, pins, NEO_GRB);
 
+Adafruit_INA219 ina219;
+
+Adafruit_LIS3DH lis = Adafruit_LIS3DH();
+
+#define OLED_RESET     4
+Adafruit_SSD1306 display(128, 32, &Wire, OLED_RESET);
+
+uint32_t total_sec = 0;
+float total_mA = 0.0;
+
 // mapping for the cape LEDs
 // there are 14 strips on the cloak, at an irregular strip on the collar
 // LEDs starting at 448 are on the collar in one continuous strip
+
+#define NUM_LED_MATRIX_HEIGHT 16
+#define NUM_LED_MATRIX_WIDTH 32
+#define NUM_LED_TOTAL 512 // total LEDs
+
 uint16_t cape_matrix[32][16] = {
 0, 63, 64, 127, 128, 191, 192, 255, 256, 319, 320, 383, 384, 447, 448, 511,
 1, 62, 65, 126, 129, 190, 193, 254, 257, 318, 321, 382, 385, 446, 449, 510,
@@ -74,23 +90,47 @@ void setup() {
   // 11 = Button (internal pulldown! set this!)
   pinMode(11, INPUT_PULLUP); // physical button on side of MCU case
   pinMode(A5, INPUT); // knob on side of MCU case
+  attachInterrupt(A5, input_checks, CHANGE);
 
   // LEDs
   leds.begin();
   brightness = (analogRead(A5) / 4);
   leds.setBrightness(brightness);
 
-  Wire.begin();
+  // I2C section
+  Wire.begin(); // begin I2C bus
+  
+  ina219.begin(); // begin power-monitoring breakout board
+  
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); // begin display
+  display.clearDisplay();
+  display.display();
+  display.setRotation(0);
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+
+  lis.begin(0x18);
+  lis.setRange(LIS3DH_RANGE_4_G);
+  lis.setClick(2, 500);
+
+  //Serial.begin(9600);
 };
 
 void loop() {
-  rain();
-  input_checks(); // slow it down a bit
+  //rain();
+  int buttonState = digitalRead(11);
+  //Serial.println(buttonState); 
+  //input_checks(); // slow it down a bit
+  //delay(1);
 };
 
 void input_checks() {
-  delay(1); // placeholder
+  brightness = (analogRead(A5) / 4);
+  leds.setBrightness(brightness);
+  //delay(1); // placeholder
 };
+
+
 
 // Given row number (0-7) and pixel number along row (0 - (NUM_LED-1)),
 // first calculate brightness (b) of pixel, then multiply row color by
@@ -111,4 +151,95 @@ void rain() {
   }
   leds.show(); // display LEDs
   frame++;
+}
+
+
+// INA219 / SSD1306 section
+// mostly taken from their example code 
+
+void power_check() {
+  // Read voltage and current from INA219.
+  float shuntvoltage = ina219.getShuntVoltage_mV();
+  float busvoltage = ina219.getBusVoltage_V();
+  float current_mA = ina219.getCurrent_mA();
+  
+  // Compute load voltage, power, and milliamp-hours.
+  float loadvoltage = busvoltage + (shuntvoltage / 1000);  
+  float power_mW = loadvoltage * current_mA;
+  total_mA += current_mA;
+  total_sec += 1;
+  float total_mAH = total_mA / 3600.0;  
+  
+  // Update display.
+  display.clearDisplay();
+  display.setCursor(0,0);
+  int mode = (total_sec / 5) % 2;
+  if (mode == 0) {
+    // Mode 0, display volts and amps.
+    printSIValue(loadvoltage, "V:", 2, 10);
+    display.setCursor(0, 16);
+    printSIValue(current_mA/1000.0, "A:", 5, 10);
+  }
+  else {
+    // Mode 1, display watts and milliamp-hours.
+    printSIValue(power_mW/1000.0, "W:", 5, 10);
+    display.setCursor(0, 16);
+    printSIValue(total_mAH/1000.0, "Ah:", 5, 10);
+  }
+  display.display();
+
+  
+}
+
+void printSIValue(float value, char* units, int precision, int maxWidth) {
+  // Print a value in SI units with the units left justified and value right justified.
+  // Will switch to milli prefix if value is below 1.
+  
+  // Add milli prefix if low value.
+  if (fabs(value) < 1.0) {
+    display.print('m');
+    maxWidth -= 1;
+    value *= 1000.0;
+    precision = max(0, precision-3);
+  }
+  
+  // Print units.
+  display.print(units);
+  maxWidth -= strlen(units);
+  
+  // Leave room for negative sign if value is negative.
+  if (value < 0.0) {
+    maxWidth -= 1;
+  }
+  
+  // Find how many digits are in value.
+  int digits = ceil(log10(fabs(value)));
+  if (fabs(value) < 1.0) {
+    digits = 1; // Leave room for 0 when value is below 0.
+  }
+  
+  // Handle if not enough width to display value, just print dashes.
+  if (digits > maxWidth) {
+    // Fill width with dashes (and add extra dash for negative values);
+    for (int i=0; i < maxWidth; ++i) {
+      display.print('-');
+    }
+    if (value < 0.0) {
+      display.print('-');
+    }
+    return;
+  }
+  
+  // Compute actual precision for printed value based on space left after
+  // printing digits and decimal point.  Clamp within 0 to desired precision.
+  int actualPrecision = constrain(maxWidth-digits-1, 0, precision);
+  
+  // Compute how much padding to add to right justify.
+  int padding = maxWidth-digits-1-actualPrecision;
+  for (int i=0; i < padding; ++i) {
+    display.print(' ');
+  }
+  
+  // Finally, print the value!
+  display.print(value, actualPrecision);
 }
